@@ -1,0 +1,980 @@
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import joblib
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    classification_report,
+    roc_auc_score,
+    average_precision_score,
+    precision_recall_curve,
+    confusion_matrix,
+    roc_curve
+)
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.tree import DecisionTreeClassifier, plot_tree, export_text
+from sklearn.inspection import permutation_importance
+
+# Optional SMOTE
+try:
+    from imblearn.over_sampling import SMOTE
+    HAS_SMOTE = True
+except Exception:
+    HAS_SMOTE = False
+
+# Optional SHAP
+try:
+    import shap
+    HAS_SHAP = True
+except Exception:
+    HAS_SHAP = False
+
+# Optional: XGBoost
+try:
+    from xgboost import XGBClassifier
+    HAS_XGB = True
+except Exception:
+    HAS_XGB = False
+
+
+# ============================
+# ⚙️ 설정
+# ============================
+DATA_PATH = "creditcard.csv"   # 업로드한 CSV 이름
+
+# 모델 설정
+DT_MAX_DEPTH = 6
+
+# MLP 구조 / 정규화 (과적합 완화 버전)
+MLP_HIDDEN = (32, 16)
+MLP_ALPHA = 1e-3  # L2 정규화 강하게
+
+# SMOTE: 완전 균형이 아니라 사기 비율을 10% 정도로만 올리기
+USE_SMOTE = True
+SMOTE_SAMPLING_STRATEGY = 0.1   # 소수 클래스가 전체의 10%가 되도록
+
+# Threshold 전략 (전역 기본값: Decision Tree / XGBoost에 사용)
+THRESHOLD_MODE = "recall"      # "precision" / "recall" / "fixed"
+THRESHOLD_PRECISION = 0.98     # precision 우선일 때 목표값
+THRESHOLD_RECALL = 0.80        # recall 우선일 때 목표값
+RECALL_PRECISION_FLOOR = 0.10  # recall 우선일 때 최소 precision 바닥값
+FIXED_THRESHOLD = 0.5
+
+# MLP는 별도 전략: Precision 기준으로 threshold 선택
+MLP_THRESHOLD_MODE = "precision"
+MLP_MIN_PRECISION = 0.90
+
+# 추가 실험 옵션
+RUN_LABEL_SHUFFLE = True        # 라벨 섞기 실험
+CHECK_TRAIN_METRICS = True      # Train 성능도 같이 보기
+
+
+# ---------------------------
+# Utils
+# ---------------------------
+def print_banner(title: str):
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+
+
+def ensure_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only numeric columns."""
+    numeric_df = df.select_dtypes(include=[np.number]).copy()
+    dropped = set(df.columns) - set(numeric_df.columns)
+    if dropped:
+        print(f"[Info] Non-numeric columns dropped from features: {sorted(list(dropped))}")
+    return numeric_df
+
+
+def print_split_stats(name, y_part):
+    pos = (y_part == 1).sum()
+    neg = (y_part == 0).sum()
+    ratio = pos / max(len(y_part), 1)
+    print(f"[Split] {name}: n={len(y_part)}, normal(0)={neg}, fraud(1)={pos}, ratio(1)={ratio:.6f}")
+
+
+def evaluate_classifier(y_true, y_prob, y_pred, title="Model"):
+    """
+    공통 평가 함수
+    - ROC-AUC, PR-AUC 계산 및 출력
+    - Confusion Matrix, Classification Report 출력
+    - ROC / PR 곡선 PNG 저장
+    - (roc_auc, pr_auc) 리턴
+    """
+    roc = roc_auc_score(y_true, y_prob)
+    pr_auc = average_precision_score(y_true, y_prob)
+
+    cm = confusion_matrix(y_true, y_pred)
+    report = classification_report(y_true, y_pred, digits=4)
+
+    print_banner(f"[{title}] Metrics")
+    print(f"ROC-AUC       : {roc:.4f}")
+    print(f"PR-AUC        : {pr_auc:.4f}")
+    print("\nConfusion Matrix (TN, FP; FN, TP):\n", cm)
+    print("\nClassification Report:\n", report)
+
+    # Precision-Recall curve
+    precision, recall, _ = precision_recall_curve(y_true, y_prob)
+    plt.figure()
+    plt.plot(recall, precision)
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title(f"Precision-Recall Curve - {title}")
+    plt.tight_layout()
+    plt.savefig(f"pr_curve_{title.replace(' ', '_').lower()}.png")
+    plt.close()
+
+    # ROC curve
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    plt.figure()
+    plt.plot(fpr, tpr)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"ROC Curve - {title}")
+    plt.tight_layout()
+    plt.savefig(f"roc_curve_{title.replace(' ', '_').lower()}.png")
+    plt.close()
+
+    return roc, pr_auc
+
+
+def pick_threshold_by_precision(y_true, y_prob, min_precision=0.98):
+    """
+    Precision-Recall 커브에서
+    Precision >= min_precision 를 만족하면서 Recall이 최대가 되는 threshold 선택.
+    """
+    p, r, thr = precision_recall_curve(y_true, y_prob)
+    # 마지막 점은 threshold가 없으므로 제외
+    p = p[:-1]
+    r = r[:-1]
+    thr = thr
+
+    mask = p >= min_precision
+    if mask.any():
+        # 그 중에서 recall이 가장 큰 threshold
+        idx = np.argmax(r[mask])
+        return thr[mask][idx]
+    # 만족하는 지점이 없으면 0.5로
+    return 0.5
+
+
+def pick_threshold_by_recall_with_floor(
+    y_true,
+    y_prob,
+    min_recall=0.90,
+    precision_floor=0.02
+):
+    """
+    Recall 우선 + Precision 바닥값을 함께 고려하는 threshold 선택 함수.
+
+    1) recall >= min_recall AND precision >= precision_floor 인 점들 중에서
+       F1-score가 최대가 되는 threshold 선택
+
+    2) 그런 점이 없다면, recall >= min_recall 인 점들 중에서
+       F1-score가 최대가 되는 threshold 선택
+
+    3) 이것마저 없으면 전체 PR 커브 기준 F1-score가 최대인 threshold 선택
+    """
+    p, r, thr = precision_recall_curve(y_true, y_prob)
+    p = p[:-1]
+    r = r[:-1]
+    thr = thr
+
+    # F1 계산 (0 division 방지)
+    denom = (p + r)
+    f1 = np.zeros_like(p)
+    nonzero = denom > 0
+    f1[nonzero] = 2 * p[nonzero] * r[nonzero] / denom[nonzero]
+
+    # 1) recall >= min_recall AND precision >= precision_floor
+    mask1 = (r >= min_recall) & (p >= precision_floor)
+    if mask1.any():
+        idx = np.argmax(f1[mask1])
+        return thr[mask1][idx], "recall+precision_floor"
+
+    # 2) recall >= min_recall 만 만족하는 지점
+    mask2 = (r >= min_recall)
+    if mask2.any():
+        idx = np.argmax(f1[mask2])
+        return thr[mask2][idx], "recall_only"
+
+    # 3) 전체 구간에서 F1 최대
+    idx = np.argmax(f1)
+    return thr[idx], "global_f1"
+
+
+def choose_threshold(
+    y_val,
+    y_val_prob,
+    mode="precision",
+    min_precision=0.98,
+    min_recall=0.90,
+    precision_floor=0.02,
+    fixed_threshold=0.5
+):
+    """
+    - mode='precision'  : Precision >= min_precision 조건에서 Recall 최대
+    - mode='recall'     : Recall >= min_recall (+ precision_floor 고려) 조건에서 F1 최대
+    - mode='fixed'      : 고정 threshold 사용
+    """
+    if mode == "precision":
+        thr = pick_threshold_by_precision(
+            y_val,
+            y_val_prob,
+            min_precision=min_precision
+        )
+        print_banner(
+            f"[Threshold] Selected by precision >= {min_precision:.2f}: thr={thr:.3f}"
+        )
+    elif mode == "recall":
+        thr, case = pick_threshold_by_recall_with_floor(
+            y_val,
+            y_val_prob,
+            min_recall=min_recall,
+            precision_floor=precision_floor
+        )
+        if case == "recall+precision_floor":
+            print_banner(
+                f"[Threshold] Selected by recall >= {min_recall:.2f} "
+                f"+ precision floor >= {precision_floor:.3f}: thr={thr:.3f}"
+            )
+        elif case == "recall_only":
+            print_banner(
+                f"[Threshold] No point satisfies recall >= {min_recall:.2f} "
+                f"and precision >= {precision_floor:.3f}.\n"
+                f"           Selected by recall >= {min_recall:.2f} (F1-max): thr={thr:.3f}"
+            )
+        else:  # global_f1
+            print_banner(
+                f"[Threshold] No point satisfies recall >= {min_recall:.2f}.\n"
+                f"           Using global F1-optimal threshold: thr={thr:.3f}"
+            )
+    else:
+        thr = fixed_threshold
+        print_banner(f"[Threshold] Using fixed threshold: thr={thr:.3f}")
+    return thr
+
+
+def generate_prob_model_explanations(
+    model_name,
+    X_test,
+    y_test,
+    y_prob,
+    y_pred,
+    feature_names,
+    threshold,
+    shap_values=None,
+    global_importances=None,
+    top_k=5,
+    file_name=None
+):
+    """
+    확률 기반 이진 분류 모델(MLP, XGBoost 등)에 대해
+    '사기(1)로 예측된 거래'마다 텍스트 설명을 만들어 파일로 저장.
+    """
+    if file_name is None:
+        file_name = f"{model_name.lower().replace(' ', '_')}_fraud_explanations.txt"
+
+    fraud_indices = np.where(y_pred == 1)[0]
+
+    lines = []
+    lines.append(f"{model_name} 기반 사기 예측 거래 설명")
+    lines.append("------------------------------------------------------------------")
+    lines.append("※ 주의: 아래 feature 값들은 StandardScaler로 정규화(표준화)된 값 기준입니다.")
+    lines.append("   - value: 해당 거래의 표준화된 feature 값(z-score)")
+    lines.append("   - threshold: 분류에 사용된 사기 판정 임계값")
+    if shap_values is not None:
+        lines.append("   - shap: 해당 feature가 사기(양수) / 정상(음수) 판정에 기여한 정도")
+    elif global_importances is not None:
+        lines.append("   - global importance: 전체 데이터 기준으로 중요한 feature 순위")
+    lines.append("")
+    lines.append(f"사용된 분류 임계값(threshold): {threshold:.3f}")
+    lines.append("")
+
+    # shap_values 모양 정리
+    sv = None
+    if shap_values is not None:
+        sv = shap_values
+        if isinstance(sv, list):
+            if len(sv) >= 2:
+                sv = sv[1]
+            else:
+                sv = sv[0]
+
+    if len(fraud_indices) == 0:
+        lines.append("테스트 데이터에서 사기(1)로 예측된 거래가 없습니다.")
+    else:
+        for idx in fraud_indices:
+            x = X_test[idx]
+            prob = y_prob[idx]
+            true_label = y_test[idx]
+
+            lines.append(f"[Case #{idx}]")
+            lines.append(
+                f"  - 실제 라벨(y_true) : {true_label} (0=정상, 1=사기)"
+            )
+            lines.append(
+                f"  - 모델 예측(y_pred) : 1 (사기) "
+                f"(임계값={threshold:.3f}, 예측 확률={prob:.4f})"
+            )
+
+            if sv is not None:
+                contrib = sv[idx]
+                order = np.argsort(-np.abs(contrib))
+                lines.append("  - 이 거래의 사기 판정에 가장 크게 기여한 feature (SHAP 기준):")
+                for rank, j in enumerate(order[:top_k]):
+                    fname = feature_names[j]
+                    fval = x[j]
+                    cval = contrib[j]
+                    sign = "사기 방향 기여(+)" if cval > 0 else "정상 방향 기여(-)"
+                    lines.append(
+                        f"    * #{rank+1} {fname}: value={fval:.3f}, "
+                        f"shap={cval:.4f} ({sign})"
+                    )
+            elif global_importances is not None:
+                gi = np.asarray(global_importances)
+                order = np.argsort(-np.abs(gi))
+                lines.append("  - 전체 기준으로 중요한 feature 상위 항목과 해당 거래의 값:")
+                for rank, j in enumerate(order[:top_k]):
+                    fname = feature_names[j]
+                    fval = x[j]
+                    imp = gi[j]
+                    lines.append(
+                        f"    * #{rank+1} {fname}: value={fval:.3f}, "
+                        f"global_importance={imp:.4f}"
+                    )
+            else:
+                lines.append("  - (추가적인 feature 중요도 정보가 없어 상세 설명을 제공하지 못했습니다.)")
+
+            lines.append("")
+
+    with open(file_name, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print_banner(f"[{model_name}] 거래별 사기 예측 설명 저장 완료")
+    print(f"Saved: {file_name}")
+
+
+# ---------------------------
+# Label Shuffle Experiment
+# ---------------------------
+def run_label_shuffle_experiment(X_train, y_train, X_val, y_val):
+    print_banner("[Label Shuffle] Sanity Check (Random Labels)")
+
+    rng = np.random.RandomState(42)
+    y_rand = y_train.copy()
+    rng.shuffle(y_rand)
+
+    model = DecisionTreeClassifier(
+        max_depth=DT_MAX_DEPTH,
+        min_samples_split=200,
+        min_samples_leaf=100,
+        max_features="sqrt",
+        random_state=42,
+        class_weight="balanced"
+    )
+    model.fit(X_train, y_rand)
+
+    y_val_prob = model.predict_proba(X_val)[:, 1]
+    y_val_pred = (y_val_prob >= 0.5).astype(int)
+
+    roc, pr = evaluate_classifier(
+        y_val, y_val_prob, y_val_pred,
+        title="LabelShuffle_Val"
+    )
+    print(f"[LabelShuffle] Expected AUC≈0.5, got ROC={roc:.3f}, PR={pr:.3f}")
+
+
+# ---------------------------
+# Decision Tree (Val → Test)
+# ---------------------------
+def fit_decision_tree(
+    X_train, y_train,
+    X_val, y_val,
+    X_test, y_test,
+    feature_names=None,
+    export_rules_depth=3,
+    save_csv=True,
+):
+    # class_weight (balanced)
+    classes = np.array([0, 1])
+    cw = compute_class_weight(class_weight="balanced", classes=classes, y=y_train)
+    class_weight = {0: cw[0], 1: cw[1]}
+    print_banner("Computed class_weight (train only, DecisionTree)")
+    print(class_weight)
+
+    model = DecisionTreeClassifier(
+        max_depth=DT_MAX_DEPTH,
+        min_samples_split=200,
+        min_samples_leaf=100,
+        max_features="sqrt",
+        random_state=42,
+        class_weight=class_weight,
+        criterion="gini"
+    )
+    model.fit(X_train, y_train)
+
+    # Validation에서 threshold 선택 (전역 설정 사용)
+    y_val_prob = model.predict_proba(X_val)[:, 1]
+    thr = choose_threshold(
+        y_val, y_val_prob,
+        mode=THRESHOLD_MODE,
+        min_precision=THRESHOLD_PRECISION,
+        min_recall=THRESHOLD_RECALL,
+        precision_floor=RECALL_PRECISION_FLOOR,
+        fixed_threshold=FIXED_THRESHOLD
+    )
+
+    # Test 평가
+    y_test_prob = model.predict_proba(X_test)[:, 1]
+    y_test_pred = (y_test_prob >= thr).astype(int)
+    test_title = f"Decision Tree (TEST, thr={thr:.3f}, mode={THRESHOLD_MODE})"
+
+    # Feature importance
+    importances = model.feature_importances_
+    fi = pd.DataFrame({"feature": feature_names, "importance": importances}) \
+           .sort_values("importance", ascending=False)
+    print_banner("[DecisionTree] Top feature importances (Gini importance)")
+    print(fi.head(20).to_string(index=False))
+    if save_csv:
+        fi.to_csv("dt_feature_importances.csv", index=False)
+
+    # Tree preview image
+    try:
+        plt.figure(figsize=(14, 8))
+        plot_tree(
+            model,
+            feature_names=feature_names,
+            filled=True,
+            max_depth=export_rules_depth,
+            rounded=True,
+            fontsize=8
+        )
+        plt.title(f"Decision Tree (depth≤{export_rules_depth} view)")
+        plt.tight_layout()
+        plt.savefig("tree_preview.png")
+        plt.close()
+    except Exception as e:
+        print(f"[Warn] Tree plot failed: {e}")
+
+    # Rule text export (전체 규칙 요약)
+    try:
+        rules = export_text(model, feature_names=feature_names, max_depth=export_rules_depth)
+        with open("decision_tree_rules_depth3.txt", "w", encoding="utf-8") as f:
+            f.write(rules)
+        print_banner("[DecisionTree] Rules (depth<=3)")
+        print(rules)
+    except Exception as e:
+        print(f"[Warn] Rule export failed: {e}")
+
+    # 공통 성능 평가
+    roc, pr_auc = evaluate_classifier(y_test, y_test_prob, y_test_pred, title=test_title)
+
+    # 거래별 설명 텍스트 생성 (Decision Tree)
+    try:
+        tree = model.tree_
+        explanations = []
+
+        fraud_indices = np.where(y_test_pred == 1)[0]
+
+        header = []
+        header.append("Decision Tree 기반 사기 예측 거래 설명")
+        header.append("------------------------------------------------------------------")
+        header.append("※ 주의: 아래 조건의 feature 값과 임계값(threshold)은 StandardScaler로")
+        header.append("   정규화(표준화)된 값 기준입니다. (원 데이터가 아니라 z-score 기준)")
+        header.append("   - value: 해당 거래의 표준화된 feature 값")
+        header.append("   - threshold: 트리가 분기한 표준화된 기준 값")
+        header.append("")
+        explanations.append("\n".join(header))
+
+        if len(fraud_indices) == 0:
+            explanations.append("테스트 데이터에서 사기(1)로 예측된 거래가 없습니다.")
+        else:
+            for idx in fraud_indices:
+                x = X_test[idx]
+                prob = y_test_prob[idx]
+                true_label = y_test[idx]
+
+                node_id = 0
+                path_lines = []
+
+                # 리프에 도달할 때까지 분기 경로 추적
+                while tree.feature[node_id] != -2:  # -2면 leaf
+                    feat_idx = tree.feature[node_id]
+                    node_thr = tree.threshold[node_id]
+                    feat_name = feature_names[feat_idx] if feature_names is not None else f"feature_{feat_idx}"
+                    x_val = x[feat_idx]
+
+                    if x_val <= node_thr:
+                        decision = "<="
+                        next_node = tree.children_left[node_id]
+                    else:
+                        decision = ">"
+                        next_node = tree.children_right[node_id]
+
+                    path_lines.append(
+                        f"  - {feat_name}: value={x_val:.3f} {decision} threshold={node_thr:.3f}"
+                    )
+                    node_id = next_node
+
+                # 리프 노드에서 클래스 분포 확인
+                node_samples = tree.n_node_samples[node_id]
+                value = tree.value[node_id][0]  # [n_normal, n_fraud]
+                normal_count, fraud_count = value[0], value[1]
+                leaf_total = value.sum()
+                leaf_fraud_ratio = fraud_count / leaf_total if leaf_total > 0 else float("nan")
+
+                case_lines = []
+                case_lines.append(f"[Case #{idx}]")
+                case_lines.append(
+                    f"  - 실제 라벨(y_true) : {true_label} "
+                    f"(0=정상, 1=사기)"
+                )
+                case_lines.append(
+                    f"  - 모델 예측(y_pred) : 1 (사기) "
+                    f"(분류 임계값={thr:.3f}, 예측 확률={prob:.4f})"
+                )
+                case_lines.append(
+                    f"  - 이 리프 노드의 데이터 분포: 정상={normal_count:.0f}, 사기={fraud_count:.0f}, "
+                    f"사기 비율={leaf_fraud_ratio:.4f}, 노드 샘플 수={node_samples}"
+                )
+                case_lines.append("  - 이 거래가 사기로 분류된 의사결정 경로:")
+                case_lines.extend(path_lines)
+                case_lines.append("")  # 공백 줄
+
+                explanations.append("\n".join(case_lines))
+
+        with open("decision_tree_fraud_explanations.txt", "w", encoding="utf-8") as f:
+            f.write("\n\n".join(explanations))
+
+        print_banner("[DecisionTree] 거래별 사기 예측 설명 저장 완료")
+        print("Saved: decision_tree_fraud_explanations.txt")
+    except Exception as e:
+        print(f"[Warn] Failed to create per-transaction explanations: {e}")
+
+    return model, fi, thr, roc, pr_auc
+
+
+# ---------------------------
+# MLP (Val → Test)
+# ---------------------------
+def fit_mlp(
+    X_train, y_train,
+    X_val, y_val,
+    X_test, y_test,
+    feature_names,
+):
+    from sklearn.neural_network import MLPClassifier
+
+    X_tr, y_tr = X_train, y_train
+    if USE_SMOTE and HAS_SMOTE:
+        print("[MLP] Applying SMOTE on training set...")
+        sm = SMOTE(random_state=42, sampling_strategy=SMOTE_SAMPLING_STRATEGY)
+        X_tr, y_tr = sm.fit_resample(X_train, y_train)
+        print(f"[MLP] After SMOTE: X_tr={X_tr.shape}, y_tr distribution -> "
+              f"normal(0)={(y_tr==0).sum()}, fraud(1)={(y_tr==1).sum()}")
+
+    mlp = MLPClassifier(
+        hidden_layer_sizes=MLP_HIDDEN,
+        activation="relu",
+        solver="adam",
+        learning_rate_init=1e-3,
+        alpha=MLP_ALPHA,        # 과적합 완화용 L2
+        max_iter=400,
+        random_state=42,
+        early_stopping=True,
+        n_iter_no_change=20,
+        validation_fraction=0.15
+    )
+    mlp.fit(X_tr, y_tr)
+
+    # Validation에서 threshold 선택 (MLP는 precision 기준 전략 사용)
+    y_val_prob = mlp.predict_proba(X_val)[:, 1]
+    thr = choose_threshold(
+        y_val, y_val_prob,
+        mode=MLP_THRESHOLD_MODE,
+        min_precision=MLP_MIN_PRECISION,
+        min_recall=THRESHOLD_RECALL,
+        precision_floor=RECALL_PRECISION_FLOOR,
+        fixed_threshold=FIXED_THRESHOLD
+    )
+
+    # Test 평가
+    y_test_prob = mlp.predict_proba(X_test)[:, 1]
+    y_test_pred = (y_test_prob >= thr).astype(int)
+    test_title = f"MLP (TEST, thr={thr:.3f}, mode={MLP_THRESHOLD_MODE})"
+    roc, pr_auc = evaluate_classifier(y_test, y_test_prob, y_test_pred, title=test_title)
+
+    # XAI: permutation importance (전역 중요도)
+    print_banner("[MLP] Permutation importance (global, scoring=average_precision)")
+    r = permutation_importance(
+        mlp, X_test, y_test,
+        n_repeats=5,
+        random_state=42,
+        scoring='average_precision'
+    )
+    pi = pd.DataFrame(
+        {'feature': feature_names, 'importance': r.importances_mean}
+    ).sort_values('importance', ascending=False)
+    pi.to_csv("mlp_permutation_importance.csv", index=False)
+    print(pi.head(20).to_string(index=False))
+    print("Saved: mlp_permutation_importance.csv")
+
+    # SHAP KernelExplainer (선택적, 시각화용)
+    if HAS_SHAP:
+        try:
+            print_banner("[MLP] SHAP (KernelExplainer, sampled)")
+            rng = np.random.RandomState(42)
+            bg_idx = rng.choice(len(X_train), size=min(300, len(X_train)), replace=False)
+            xs_idx = rng.choice(len(X_test),  size=min(300, len(X_test)),  replace=False)
+            bg = X_train[bg_idx]
+            xs = X_test[xs_idx]
+
+            f = lambda data: mlp.predict_proba(data)[:, 1]
+            explainer = shap.KernelExplainer(f, bg)
+            shap_values_sample = explainer.shap_values(xs, nsamples=200)
+
+            shap.summary_plot(shap_values_sample, xs, feature_names=feature_names, show=False)
+            plt.title("MLP SHAP (KernelExplainer, sample)")
+            plt.tight_layout()
+            plt.savefig("mlp_shap_kernel.png")
+            plt.close()
+            print("[MLP] SHAP plot saved: mlp_shap_kernel.png")
+        except Exception as e:
+            print(f"[Warn] SHAP KernelExplainer failed: {e}")
+
+    # 거래별 설명 텍스트 생성 (MLP)
+    try:
+        generate_prob_model_explanations(
+            model_name="MLP",
+            X_test=X_test,
+            y_test=y_test,
+            y_prob=y_test_prob,
+            y_pred=y_test_pred,
+            feature_names=feature_names,
+            threshold=thr,
+            shap_values=None,  # 여기서는 SHAP 대신 전역 중요도 사용
+            global_importances=r.importances_mean,
+            top_k=5,
+            file_name="mlp_fraud_explanations.txt"
+        )
+    except Exception as e:
+        print(f"[Warn] Failed to create MLP per-transaction explanations: {e}")
+
+    return mlp, thr, roc, pr_auc
+
+
+# ---------------------------
+# XGBoost (Val → Test)
+# ---------------------------
+def fit_xgboost(
+    X_train, y_train,
+    X_val, y_val,
+    X_test, y_test,
+    feature_names,
+    save_csv=True
+):
+    if not HAS_XGB:
+        print("[XGBoost] XGBoost not installed. Skipping.")
+        return None, None, None, None
+
+    # class imbalance 대응 (실제 비율 사용)
+    pos = (y_train == 1).sum()
+    neg = (y_train == 0).sum()
+    raw_ratio = neg / max(pos, 1)
+    scale_pos_weight = raw_ratio
+    print(f"[XGBoost] neg/pos = {raw_ratio:.2f}, using scale_pos_weight = {scale_pos_weight:.2f}")
+
+    model = XGBClassifier(
+        random_state=42,
+        n_estimators=400,        # 트리 수 증가
+        max_depth=4,             # 깊이는 살짝 줄임
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=1,
+        gamma=0.0,
+        scale_pos_weight=scale_pos_weight,
+        eval_metric="aucpr",
+        early_stopping_rounds=30,
+        n_jobs=-1
+    )
+
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=False
+    )
+
+    # Validation에서 threshold 선택 (전역 설정 사용)
+    y_val_prob = model.predict_proba(X_val)[:, 1]
+    thr = choose_threshold(
+        y_val, y_val_prob,
+        mode=THRESHOLD_MODE,
+        min_precision=THRESHOLD_PRECISION,
+        min_recall=THRESHOLD_RECALL,
+        precision_floor=RECALL_PRECISION_FLOOR,
+        fixed_threshold=FIXED_THRESHOLD
+    )
+
+    # Test 평가
+    y_test_prob = model.predict_proba(X_test)[:, 1]
+    y_test_pred = (y_test_prob >= thr).astype(int)
+    test_title = f"XGBoost (TEST, thr={thr:.3f}, mode={THRESHOLD_MODE})"
+    roc, pr_auc = evaluate_classifier(y_test, y_test_prob, y_test_pred, title=test_title)
+
+    # Feature importance
+    importances = model.feature_importances_
+    fi = pd.DataFrame({"feature": feature_names, "importance": importances}) \
+           .sort_values("importance", ascending=False)
+    print_banner("[XGBoost] Top feature importances (gain-based)")
+    print(fi.head(20).to_string(index=False))
+    if save_csv:
+        fi.to_csv("xgb_feature_importances.csv", index=False)
+
+    # SHAP TreeExplainer
+    shap_values_full = None
+    if HAS_SHAP:
+        try:
+            print_banner("[XGBoost] SHAP (TreeExplainer)")
+            explainer = shap.TreeExplainer(model)
+            shap_values_full = explainer.shap_values(X_test)
+
+            shap.summary_plot(shap_values_full, X_test, feature_names=feature_names, show=False)
+            plt.title("XGBoost SHAP (TreeExplainer)")
+            plt.tight_layout()
+            plt.savefig("xgb_shap_summary.png")
+            plt.close()
+            print("[XGBoost] SHAP plot saved: xgb_shap_summary.png")
+        except Exception as e:
+            print(f"[Warn] XGB SHAP TreeExplainer failed: {e}")
+            shap_values_full = None
+
+    # 거래별 설명 텍스트 생성 (XGBoost)
+    try:
+        generate_prob_model_explanations(
+            model_name="XGBoost",
+            X_test=X_test,
+            y_test=y_test,
+            y_prob=y_test_prob,
+            y_pred=y_test_pred,
+            feature_names=feature_names,
+            threshold=thr,
+            shap_values=shap_values_full,
+            global_importances=importances,
+            top_k=5,
+            file_name="xgb_fraud_explanations.txt"
+        )
+    except Exception as e:
+        print(f"[Warn] Failed to create XGBoost per-transaction explanations: {e}")
+
+    return model, thr, roc, pr_auc
+
+
+# ---------------------------
+# Main
+# ---------------------------
+def main():
+    # Load
+    print_banner("Load dataset")
+    try:
+        df = pd.read_csv(DATA_PATH, on_bad_lines='skip')
+        print(df.head())
+    except Exception as e:
+        print(f"Error loading CSV: {e}")
+        return
+
+    # Label column 선택: 'fraud' 또는 'Class'
+    if "fraud" in df.columns:
+        label_col = "fraud"
+    elif "Class" in df.columns:
+        label_col = "Class"
+    else:
+        raise ValueError("Label column not found. Please ensure your CSV has 'fraud' or 'Class' column.")
+
+    print(f"[Info] Using label column: '{label_col}'")
+
+    # Amount → LogAmount
+    if "Amount" in df.columns:
+        print("[Info] Applying log1p transform to 'Amount' → 'LogAmount'")
+        df["LogAmount"] = np.log1p(df["Amount"])
+        df = df.drop(columns=["Amount"])
+
+    # Label 처리
+    y_raw = df[label_col]
+    if y_raw.isnull().any() or np.isinf(y_raw).any():
+        print("[Info] Handling non-finite values in label column...")
+        y_raw = y_raw.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    y = y_raw.astype(int).values
+
+    # Features: label 제외 + numeric only
+    X_full_raw = df.drop(columns=[label_col])
+    X_full_raw = ensure_numeric(X_full_raw)
+    X_full_raw.replace([np.inf, -np.inf], np.nan, inplace=True)
+    feature_names = list(X_full_raw.columns)
+
+    print_banner("Basic info (overall)")
+    print(f"Shape: X={X_full_raw.shape}, y={y.shape}")
+    pos = (y == 1).sum()
+    neg = (y == 0).sum()
+    print(f"Label distribution -> normal(0): {neg}, fraud(1): {pos}, ratio(1): {pos / max(1, len(y)):.6f}")
+
+    # ---------------------------
+    # Train / Val / Test split (60 / 20 / 20) - stratified random
+    # ---------------------------
+    X_train_temp, X_test_raw, y_train_temp, y_test = train_test_split(
+        X_full_raw.values, y,
+        test_size=0.2,
+        random_state=42,
+        stratify=y
+    )
+
+    X_train_raw, X_val_raw, y_train, y_val = train_test_split(
+        X_train_temp, y_train_temp,
+        test_size=0.25,   # 0.8 * 0.25 = 0.2 → Val
+        random_state=42,
+        stratify=y_train_temp
+    )
+
+    print_banner("Split statistics")
+    print_split_stats("Train", y_train)
+    print_split_stats("Val", y_val)
+    print_split_stats("Test", y_test)
+
+    # Imputer (fit on train만)
+    imputer = SimpleImputer(strategy='mean')
+    X_train_imp = imputer.fit_transform(X_train_raw)
+    X_val_imp = imputer.transform(X_val_raw)
+    X_test_imp = imputer.transform(X_test_raw)
+
+    # Scaler (fit on train만)
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train_imp)
+    X_val = scaler.transform(X_val_imp)
+    X_test = scaler.transform(X_test_imp)
+
+    # ---------------------------
+    # Label Shuffle Experiment
+    # ---------------------------
+    if RUN_LABEL_SHUFFLE:
+        run_label_shuffle_experiment(X_train, y_train, X_val, y_val)
+
+    results = []  # 모델별 AUC 요약용
+
+    # 1) Decision Tree
+    dt_model, dt_fi, dt_thr, dt_roc, dt_pr = fit_decision_tree(
+        X_train, y_train,
+        X_val, y_val,
+        X_test, y_test,
+        feature_names=feature_names,
+        export_rules_depth=3,
+        save_csv=True,
+    )
+    results.append({
+        "model": "Decision Tree",
+        "roc_auc": dt_roc,
+        "pr_auc": dt_pr
+    })
+
+    # 2) MLP (precision 기반 threshold)
+    mlp_model, mlp_thr, mlp_roc, mlp_pr = fit_mlp(
+        X_train, y_train,
+        X_val, y_val,
+        X_test, y_test,
+        feature_names=feature_names,
+    )
+    results.append({
+        "model": "MLP",
+        "roc_auc": mlp_roc,
+        "pr_auc": mlp_pr
+    })
+
+    # 3) XGBoost (튜닝 버전)
+    xgb_model, xgb_thr, xgb_roc, xgb_pr = fit_xgboost(
+        X_train, y_train,
+        X_val, y_val,
+        X_test, y_test,
+        feature_names=feature_names,
+    )
+    if xgb_model is not None:
+        results.append({
+            "model": "XGBoost",
+            "roc_auc": xgb_roc,
+            "pr_auc": xgb_pr
+        })
+
+    # ---------------------------
+    # Train set metrics (overfitting check)
+    # ---------------------------
+    if CHECK_TRAIN_METRICS:
+        print_banner("[TRAIN METRICS] Decision Tree")
+        y_train_prob = dt_model.predict_proba(X_train)[:, 1]
+        y_train_pred = (y_train_prob >= dt_thr).astype(int)
+        evaluate_classifier(y_train, y_train_prob, y_train_pred, title="DecisionTree_TRAIN")
+
+        print_banner("[TRAIN METRICS] MLP")
+        y_train_prob = mlp_model.predict_proba(X_train)[:, 1]
+        y_train_pred = (y_train_prob >= mlp_thr).astype(int)
+        evaluate_classifier(y_train, y_train_prob, y_train_pred, title="MLP_TRAIN")
+
+        if xgb_model is not None:
+            print_banner("[TRAIN METRICS] XGBoost")
+            y_train_prob = xgb_model.predict_proba(X_train)[:, 1]
+            y_train_pred = (y_train_prob >= xgb_thr).astype(int)
+            evaluate_classifier(y_train, y_train_prob, y_train_pred, title="XGBoost_TRAIN")
+
+    # ---------------------------
+    # 모델별 AUC 요약
+    # ---------------------------
+    if results:
+        print_banner("Summary: Area under curves (performance)")
+        df_res = pd.DataFrame(results)
+        print(df_res.to_string(index=False))
+        df_res.to_csv("model_auc_summary.csv", index=False)
+        print("\n[Info] Saved summary to model_auc_summary.csv")
+
+    # ---------------------------
+    # Preprocessor & 모델 저장
+    # ---------------------------
+    print_banner("Saving models and preprocessors")
+    try:
+        joblib.dump(scaler, 'scaler.joblib')
+        joblib.dump(imputer, 'imputer.joblib')
+        print("Saved: scaler.joblib, imputer.joblib")
+
+        # 최종 배포용 모델: XGBoost 있으면 XGB, 없으면 Decision Tree
+        if xgb_model is not None:
+            joblib.dump(xgb_model, 'xgb_model.joblib')
+            print("Saved: xgb_model.joblib (Recommended model)")
+        else:
+            joblib.dump(dt_model, 'dt_model.joblib')
+            print("Saved: dt_model.joblib (Fallback model)")
+    except Exception as e:
+        print(f"[Warn] Failed to save models: {e}")
+
+    print_banner("Done")
+    print("Saved figures: pr_curve_*.png, roc_curve_*.png, tree_preview.png, "
+          "decision_tree_rules_depth3.txt, "
+          "mlp_shap_kernel.png (if SHAP), mlp_permutation_importance.csv, "
+          "xgb_shap_summary.png (if SHAP), xgb_feature_importances.csv (if XGB), "
+          "dt_feature_importances.csv, "
+          "model_auc_summary.csv, "
+          "decision_tree_fraud_explanations.txt, "
+          "mlp_fraud_explanations.txt, "
+          "xgb_fraud_explanations.txt.")
+    print("Saved models: scaler.joblib, imputer.joblib, "
+          "xgb_model.joblib (if XGB) or dt_model.joblib (fallback).")
+
+
+# 실행
+if __name__ == "__main__":
+    main()
