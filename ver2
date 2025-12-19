@@ -45,31 +45,20 @@ except Exception:
 
 
 # ============================
-# ⚙️ 설정
+# ⚙️ 설정 (Colab에서 여기만 바꿔 쓰면 됨)
 # ============================
 DATA_PATH = "creditcard.csv"   # 업로드한 CSV 이름
 
-# 모델 설정
-DT_MAX_DEPTH = 6
+# 모델 설정 (creditcard 데이터셋 기준으로 조정)
+DT_MAX_DEPTH = 8                          # 기존 6 → 8 (조금 더 복잡하게)
+MLP_HIDDEN = (32, 16)                     # 기존 (64, 32, 16) → 조금 단순화
+USE_SMOTE = True                          # 희소 양성 클래스 보완
 
-# MLP 구조 / 정규화 (과적합 완화 버전)
-MLP_HIDDEN = (32, 16)
-MLP_ALPHA = 1e-3  # L2 정규화 강하게
-
-# SMOTE: 완전 균형이 아니라 사기 비율을 10% 정도로만 올리기
-USE_SMOTE = True
-SMOTE_SAMPLING_STRATEGY = 0.1   # 소수 클래스가 전체의 10%가 되도록
-
-# Threshold 전략 (전역 기본값: Decision Tree / XGBoost에 사용)
-THRESHOLD_MODE = "recall"      # "precision" / "recall" / "fixed"
-THRESHOLD_PRECISION = 0.98     # precision 우선일 때 목표값
-THRESHOLD_RECALL = 0.80        # recall 우선일 때 목표값
-RECALL_PRECISION_FLOOR = 0.10  # recall 우선일 때 최소 precision 바닥값
+# Threshold 전략
+THRESHOLD_MODE = "precision"   # "precision" / "recall" / "fixed"
+THRESHOLD_PRECISION = 0.98
+THRESHOLD_RECALL = 0.99
 FIXED_THRESHOLD = 0.5
-
-# MLP는 별도 전략: Precision 기준으로 threshold 선택
-MLP_THRESHOLD_MODE = "precision"
-MLP_MIN_PRECISION = 0.90
 
 # 추가 실험 옵션
 RUN_LABEL_SHUFFLE = True        # 라벨 섞기 실험
@@ -150,113 +139,45 @@ def pick_threshold_by_precision(y_true, y_prob, min_precision=0.98):
     """
     Precision-Recall 커브에서
     Precision >= min_precision 를 만족하면서 Recall이 최대가 되는 threshold 선택.
+    PR 커브: p, r 길이는 n+1, threshold는 n → p[:-1]/r[:-1]와 align.
     """
     p, r, thr = precision_recall_curve(y_true, y_prob)
-    # 마지막 점은 threshold가 없으므로 제외
-    p = p[:-1]
-    r = r[:-1]
-    thr = thr
-
-    mask = p >= min_precision
+    mask = p[:-1] >= min_precision
     if mask.any():
-        # 그 중에서 recall이 가장 큰 threshold
-        idx = np.argmax(r[mask])
+        idx = np.argmax(r[:-1][mask])
         return thr[mask][idx]
-    # 만족하는 지점이 없으면 0.5로
-    return 0.5
+    return 0.5  # 목표 precision을 만족 못하면 기본값
 
 
-def pick_threshold_by_recall_with_floor(
-    y_true,
-    y_prob,
-    min_recall=0.90,
-    precision_floor=0.02
-):
+def pick_threshold_by_recall(y_true, y_prob, min_recall=0.99):
     """
-    Recall 우선 + Precision 바닥값을 함께 고려하는 threshold 선택 함수.
-
-    1) recall >= min_recall AND precision >= precision_floor 인 점들 중에서
-       F1-score가 최대가 되는 threshold 선택
-
-    2) 그런 점이 없다면, recall >= min_recall 인 점들 중에서
-       F1-score가 최대가 되는 threshold 선택
-
-    3) 이것마저 없으면 전체 PR 커브 기준 F1-score가 최대인 threshold 선택
+    Precision-Recall 커브에서
+    Recall >= min_recall 를 만족하면서 Precision이 최대가 되는 threshold 선택.
     """
     p, r, thr = precision_recall_curve(y_true, y_prob)
-    p = p[:-1]
-    r = r[:-1]
-    thr = thr
-
-    # F1 계산 (0 division 방지)
-    denom = (p + r)
-    f1 = np.zeros_like(p)
-    nonzero = denom > 0
-    f1[nonzero] = 2 * p[nonzero] * r[nonzero] / denom[nonzero]
-
-    # 1) recall >= min_recall AND precision >= precision_floor
-    mask1 = (r >= min_recall) & (p >= precision_floor)
-    if mask1.any():
-        idx = np.argmax(f1[mask1])
-        return thr[mask1][idx], "recall+precision_floor"
-
-    # 2) recall >= min_recall 만 만족하는 지점
-    mask2 = (r >= min_recall)
-    if mask2.any():
-        idx = np.argmax(f1[mask2])
-        return thr[mask2][idx], "recall_only"
-
-    # 3) 전체 구간에서 F1 최대
-    idx = np.argmax(f1)
-    return thr[idx], "global_f1"
+    mask = r[:-1] >= min_recall
+    if mask.any():
+        idx = np.argmax(p[:-1][mask])
+        return thr[mask][idx]
+    return 0.5  # 목표 recall을 만족 못하면 기본값
 
 
-def choose_threshold(
-    y_val,
-    y_val_prob,
-    mode="precision",
-    min_precision=0.98,
-    min_recall=0.90,
-    precision_floor=0.02,
-    fixed_threshold=0.5
-):
+def choose_threshold(y_val, y_val_prob,
+                     mode="precision",
+                     min_precision=0.98,
+                     min_recall=0.99,
+                     fixed_threshold=0.5):
     """
     - mode='precision'  : Precision >= min_precision 조건에서 Recall 최대
-    - mode='recall'     : Recall >= min_recall (+ precision_floor 고려) 조건에서 F1 최대
+    - mode='recall'     : Recall    >= min_recall    조건에서 Precision 최대
     - mode='fixed'      : 고정 threshold 사용
     """
     if mode == "precision":
-        thr = pick_threshold_by_precision(
-            y_val,
-            y_val_prob,
-            min_precision=min_precision
-        )
-        print_banner(
-            f"[Threshold] Selected by precision >= {min_precision:.2f}: thr={thr:.3f}"
-        )
+        thr = pick_threshold_by_precision(y_val, y_val_prob, min_precision=min_precision)
+        print_banner(f"[Threshold] Selected by precision >= {min_precision:.2f}: thr={thr:.3f}")
     elif mode == "recall":
-        thr, case = pick_threshold_by_recall_with_floor(
-            y_val,
-            y_val_prob,
-            min_recall=min_recall,
-            precision_floor=precision_floor
-        )
-        if case == "recall+precision_floor":
-            print_banner(
-                f"[Threshold] Selected by recall >= {min_recall:.2f} "
-                f"+ precision floor >= {precision_floor:.3f}: thr={thr:.3f}"
-            )
-        elif case == "recall_only":
-            print_banner(
-                f"[Threshold] No point satisfies recall >= {min_recall:.2f} "
-                f"and precision >= {precision_floor:.3f}.\n"
-                f"           Selected by recall >= {min_recall:.2f} (F1-max): thr={thr:.3f}"
-            )
-        else:  # global_f1
-            print_banner(
-                f"[Threshold] No point satisfies recall >= {min_recall:.2f}.\n"
-                f"           Using global F1-optimal threshold: thr={thr:.3f}"
-            )
+        thr = pick_threshold_by_recall(y_val, y_val_prob, min_recall=min_recall)
+        print_banner(f"[Threshold] Selected by recall >= {min_recall:.2f}: thr={thr:.3f}")
     else:
         thr = fixed_threshold
         print_banner(f"[Threshold] Using fixed threshold: thr={thr:.3f}")
@@ -279,6 +200,9 @@ def generate_prob_model_explanations(
     """
     확률 기반 이진 분류 모델(MLP, XGBoost 등)에 대해
     '사기(1)로 예측된 거래'마다 텍스트 설명을 만들어 파일로 저장.
+
+    - shap_values: (n_samples, n_features) 또는 [class0, class1, ...] 리스트
+    - global_importances: (n_features,) 형태의 전역 feature importance (permutation 등)
     """
     if file_name is None:
         file_name = f"{model_name.lower().replace(' ', '_')}_fraud_explanations.txt"
@@ -304,6 +228,7 @@ def generate_prob_model_explanations(
     if shap_values is not None:
         sv = shap_values
         if isinstance(sv, list):
+            # binary일 때 [class0, class1] 구조일 수 있음
             if len(sv) >= 2:
                 sv = sv[1]
             else:
@@ -326,6 +251,7 @@ def generate_prob_model_explanations(
                 f"(임계값={threshold:.3f}, 예측 확률={prob:.4f})"
             )
 
+            # feature 중요도 순서 계산
             if sv is not None:
                 contrib = sv[idx]
                 order = np.argsort(-np.abs(contrib))
@@ -361,6 +287,30 @@ def generate_prob_model_explanations(
 
     print_banner(f"[{model_name}] 거래별 사기 예측 설명 저장 완료")
     print(f"Saved: {file_name}")
+
+
+# ---------------------------
+# Balanced subset (undersampling for highly imbalanced data)
+# ---------------------------
+def make_balanced_subset(X, y, max_normal=50000, random_state=42):
+    """
+    정상(0)을 max_normal 개까지만 사용하고, 모든 사기(1)를 유지하여
+    더 균형 잡힌 학습용 서브셋을 만듦.
+    """
+    X = np.asarray(X)
+    y = np.asarray(y)
+    idx_normal = np.where(y == 0)[0]
+    idx_fraud = np.where(y == 1)[0]
+
+    rng = np.random.RandomState(random_state)
+
+    if len(idx_normal) > max_normal:
+        idx_normal = rng.choice(idx_normal, size=max_normal, replace=False)
+
+    idx_new = np.concatenate([idx_normal, idx_fraud])
+    rng.shuffle(idx_new)
+
+    return X[idx_new], y[idx_new]
 
 
 # ---------------------------
@@ -404,32 +354,34 @@ def fit_decision_tree(
     export_rules_depth=3,
     save_csv=True,
 ):
-    # class_weight (balanced)
+    # 언더샘플링으로 균형 잡힌 학습 세트 구성
+    X_tr, y_tr = make_balanced_subset(X_train, y_train, max_normal=50000, random_state=42)
+
+    # class_weight (balanced) - balanced subset 기준
     classes = np.array([0, 1])
-    cw = compute_class_weight(class_weight="balanced", classes=classes, y=y_train)
+    cw = compute_class_weight(class_weight="balanced", classes=classes, y=y_tr)
     class_weight = {0: cw[0], 1: cw[1]}
-    print_banner("Computed class_weight (train only, DecisionTree)")
+    print_banner("Computed class_weight (balanced subset, DecisionTree)")
     print(class_weight)
 
     model = DecisionTreeClassifier(
         max_depth=DT_MAX_DEPTH,
-        min_samples_split=200,
-        min_samples_leaf=100,
+        min_samples_split=50,      # 기존 200 → 50
+        min_samples_leaf=20,       # 기존 100 → 20
         max_features="sqrt",
         random_state=42,
         class_weight=class_weight,
-        criterion="gini"
+        criterion="gini"           # 필요 시 "entropy"로 바꿔 비교 가능
     )
-    model.fit(X_train, y_train)
+    model.fit(X_tr, y_tr)
 
-    # Validation에서 threshold 선택 (전역 설정 사용)
+    # Validation에서 threshold 선택 (원래 분포의 Val 사용)
     y_val_prob = model.predict_proba(X_val)[:, 1]
     thr = choose_threshold(
         y_val, y_val_prob,
         mode=THRESHOLD_MODE,
         min_precision=THRESHOLD_PRECISION,
         min_recall=THRESHOLD_RECALL,
-        precision_floor=RECALL_PRECISION_FLOOR,
         fixed_threshold=FIXED_THRESHOLD
     )
 
@@ -478,7 +430,9 @@ def fit_decision_tree(
     # 공통 성능 평가
     roc, pr_auc = evaluate_classifier(y_test, y_test_prob, y_test_pred, title=test_title)
 
+    # ============================
     # 거래별 설명 텍스트 생성 (Decision Tree)
+    # ============================
     try:
         tree = model.tree_
         explanations = []
@@ -577,40 +531,37 @@ def fit_mlp(
     X_tr, y_tr = X_train, y_train
     if USE_SMOTE and HAS_SMOTE:
         print("[MLP] Applying SMOTE on training set...")
-        sm = SMOTE(random_state=42, sampling_strategy=SMOTE_SAMPLING_STRATEGY)
+        sm = SMOTE(random_state=42, sampling_strategy="auto")
         X_tr, y_tr = sm.fit_resample(X_train, y_train)
-        print(f"[MLP] After SMOTE: X_tr={X_tr.shape}, y_tr distribution -> "
-              f"normal(0)={(y_tr==0).sum()}, fraud(1)={(y_tr==1).sum()}")
 
     mlp = MLPClassifier(
         hidden_layer_sizes=MLP_HIDDEN,
         activation="relu",
         solver="adam",
-        learning_rate_init=1e-3,
-        alpha=MLP_ALPHA,        # 과적합 완화용 L2
-        max_iter=400,
+        learning_rate_init=5e-4,   # 1e-3 → 조금 더 천천히 학습
+        alpha=1e-3,                # L2 정규화 강화 (1e-4 → 1e-3)
+        max_iter=600,              # 여유 있게
         random_state=42,
         early_stopping=True,
-        n_iter_no_change=20,
+        n_iter_no_change=30,
         validation_fraction=0.15
     )
     mlp.fit(X_tr, y_tr)
 
-    # Validation에서 threshold 선택 (MLP는 precision 기준 전략 사용)
+    # Validation에서 threshold 선택
     y_val_prob = mlp.predict_proba(X_val)[:, 1]
     thr = choose_threshold(
         y_val, y_val_prob,
-        mode=MLP_THRESHOLD_MODE,
-        min_precision=MLP_MIN_PRECISION,
+        mode=THRESHOLD_MODE,
+        min_precision=THRESHOLD_PRECISION,
         min_recall=THRESHOLD_RECALL,
-        precision_floor=RECALL_PRECISION_FLOOR,
         fixed_threshold=FIXED_THRESHOLD
     )
 
     # Test 평가
     y_test_prob = mlp.predict_proba(X_test)[:, 1]
     y_test_pred = (y_test_prob >= thr).astype(int)
-    test_title = f"MLP (TEST, thr={thr:.3f}, mode={MLP_THRESHOLD_MODE})"
+    test_title = f"MLP (TEST, thr={thr:.3f}, mode={THRESHOLD_MODE})"
     roc, pr_auc = evaluate_classifier(y_test, y_test_prob, y_test_pred, title=test_title)
 
     # XAI: permutation importance (전역 중요도)
@@ -686,42 +637,44 @@ def fit_xgboost(
         print("[XGBoost] XGBoost not installed. Skipping.")
         return None, None, None, None
 
-    # class imbalance 대응 (실제 비율 사용)
-    pos = (y_train == 1).sum()
-    neg = (y_train == 0).sum()
+    # 언더샘플링된 학습 세트 사용 (DT와 동일 전략)
+    X_tr, y_tr = make_balanced_subset(X_train, y_train, max_normal=50000, random_state=42)
+
+    # class imbalance 대응 (완화된 scale_pos_weight)
+    pos = (y_tr == 1).sum()
+    neg = (y_tr == 0).sum()
     raw_ratio = neg / max(pos, 1)
-    scale_pos_weight = raw_ratio
-    print(f"[XGBoost] neg/pos = {raw_ratio:.2f}, using scale_pos_weight = {scale_pos_weight:.2f}")
+    scale_pos_weight = np.sqrt(raw_ratio)  # 기존 neg/pos → sqrt(neg/pos)로 완화
+    print(f"[XGBoost] raw neg/pos = {raw_ratio:.2f}, using scale_pos_weight: {scale_pos_weight:.2f}")
 
     model = XGBClassifier(
         random_state=42,
-        n_estimators=400,        # 트리 수 증가
-        max_depth=4,             # 깊이는 살짝 줄임
+        n_estimators=500,         # 200 → 500
+        max_depth=4,             # 5 → 4 (overfit 완화)
         learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=1,
-        gamma=0.0,
         scale_pos_weight=scale_pos_weight,
+        subsample=0.8,           # 추가: row subsampling
+        colsample_bytree=0.8,    # 추가: col subsampling
+        reg_lambda=1.0,          # L2 regularization
+        reg_alpha=0.0,
         eval_metric="aucpr",
-        early_stopping_rounds=30,
+        early_stopping_rounds=50,
         n_jobs=-1
     )
 
     model.fit(
-        X_train, y_train,
+        X_tr, y_tr,
         eval_set=[(X_val, y_val)],
         verbose=False
     )
 
-    # Validation에서 threshold 선택 (전역 설정 사용)
+    # Validation에서 threshold 선택
     y_val_prob = model.predict_proba(X_val)[:, 1]
     thr = choose_threshold(
         y_val, y_val_prob,
         mode=THRESHOLD_MODE,
         min_precision=THRESHOLD_PRECISION,
         min_recall=THRESHOLD_RECALL,
-        precision_floor=RECALL_PRECISION_FLOOR,
         fixed_threshold=FIXED_THRESHOLD
     )
 
@@ -740,7 +693,7 @@ def fit_xgboost(
     if save_csv:
         fi.to_csv("xgb_feature_importances.csv", index=False)
 
-    # SHAP TreeExplainer
+    # SHAP TreeExplainer (가능하면 개별 거래 설명에도 활용)
     shap_values_full = None
     if HAS_SHAP:
         try:
@@ -780,7 +733,7 @@ def fit_xgboost(
 
 
 # ---------------------------
-# Main
+# Main (Colab용, argparse 없음)
 # ---------------------------
 def main():
     # Load
@@ -792,21 +745,20 @@ def main():
         print(f"Error loading CSV: {e}")
         return
 
-    # Label column 선택: 'fraud' 또는 'Class'
+    # 라벨 컬럼 자동 인식: 'fraud' 또는 'Class'
     if "fraud" in df.columns:
         label_col = "fraud"
     elif "Class" in df.columns:
         label_col = "Class"
     else:
-        raise ValueError("Label column not found. Please ensure your CSV has 'fraud' or 'Class' column.")
+        raise ValueError("Label column not found. 'fraud' 또는 'Class' 컬럼이 필요합니다.")
 
     print(f"[Info] Using label column: '{label_col}'")
 
-    # Amount → LogAmount
+    # Amount 로그 변환 (있을 경우)
     if "Amount" in df.columns:
         print("[Info] Applying log1p transform to 'Amount' → 'LogAmount'")
         df["LogAmount"] = np.log1p(df["Amount"])
-        df = df.drop(columns=["Amount"])
 
     # Label 처리
     y_raw = df[label_col]
@@ -816,8 +768,11 @@ def main():
 
     y = y_raw.astype(int).values
 
-    # Features: label 제외 + numeric only
-    X_full_raw = df.drop(columns=[label_col])
+    # Features: numeric only (label 및 원 Amount 제외)
+    drop_cols = [label_col]
+    if "Amount" in df.columns:
+        drop_cols.append("Amount")  # 원 Amount는 제거, LogAmount만 사용
+    X_full_raw = df.drop(columns=drop_cols)
     X_full_raw = ensure_numeric(X_full_raw)
     X_full_raw.replace([np.inf, -np.inf], np.nan, inplace=True)
     feature_names = list(X_full_raw.columns)
@@ -885,7 +840,7 @@ def main():
         "pr_auc": dt_pr
     })
 
-    # 2) MLP (precision 기반 threshold)
+    # 2) MLP
     mlp_model, mlp_thr, mlp_roc, mlp_pr = fit_mlp(
         X_train, y_train,
         X_val, y_val,
@@ -898,7 +853,7 @@ def main():
         "pr_auc": mlp_pr
     })
 
-    # 3) XGBoost (튜닝 버전)
+    # 3) XGBoost
     xgb_model, xgb_thr, xgb_roc, xgb_pr = fit_xgboost(
         X_train, y_train,
         X_val, y_val,
@@ -976,5 +931,4 @@ def main():
 
 
 # 실행
-if __name__ == "__main__":
-    main()
+main()
